@@ -7784,12 +7784,8 @@ class GatewayRunner:
         The gateway /model command stores per-session overrides in
         ``_session_model_overrides``. These must take precedence over
         config.yaml defaults so the switched model is actually used for
-        subsequent messages.
-
-        Important nuance: when the override switches providers, blank runtime
-        fields from the picker (e.g. base_url/api_key) must clear inherited
-        values from the previous provider instead of silently mixing two
-        providers together.
+        subsequent messages. Blank/None runtime override fields are skipped so
+        incomplete picker state does not wipe already-resolved runtime config.
         """
         override = self._session_model_overrides.get(session_key)
         if not override:
@@ -7802,22 +7798,13 @@ class GatewayRunner:
             return value
 
         override_model = _normalize(override.get("model"))
-        override_provider = _normalize(override.get("provider"))
         if override_model:
             model = override_model
 
-        current_provider = _normalize(runtime_kwargs.get("provider"))
-        provider_changed = bool(override_provider and override_provider != current_provider)
-
-        if override_provider:
-            runtime_kwargs["provider"] = override_provider
-
-        for key in ("api_key", "base_url", "api_mode"):
+        for key in ("provider", "api_key", "base_url", "api_mode"):
             val = _normalize(override.get(key))
             if val:
                 runtime_kwargs[key] = val
-            elif provider_changed:
-                runtime_kwargs.pop(key, None)
 
         return model, runtime_kwargs
 

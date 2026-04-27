@@ -144,8 +144,8 @@ class TestApplySessionModelOverride:
         assert rt["base_url"] == "https://api.anthropic.com"  # preserved
         assert rt["api_mode"] == "chat_completions"  # overwritten (not None)
 
-    def test_empty_string_overwrites(self):
-        """Empty string is not None — it should overwrite the config value."""
+    def test_empty_string_does_not_overwrite(self):
+        """Blank override fields should preserve resolved runtime defaults."""
         runner = _make_runner()
         sk = build_session_key(_make_source())
 
@@ -163,7 +163,7 @@ class TestApplySessionModelOverride:
             {"provider": "anthropic", "api_key": "ant-key", "base_url": "https://api.anthropic.com", "api_mode": "anthropic_messages"},
         )
 
-        assert rt["base_url"] == ""  # empty string overwrites
+        assert rt["base_url"] == "https://api.anthropic.com"
 
     def test_different_session_key_not_affected(self):
         runner = _make_runner()
@@ -185,6 +185,47 @@ class TestApplySessionModelOverride:
         )
 
         assert model == "anthropic/claude-sonnet-4"  # unchanged — wrong session key
+
+
+def test_resolve_session_runtime_incomplete_override_keeps_config_base_url(monkeypatch):
+    """Incomplete session override should not blank out runtime base_url/api_key."""
+    runner = _make_runner()
+    sk = build_session_key(_make_source())
+    source = _make_source()
+
+    runner._session_model_overrides[sk] = {
+        "model": "claude-opus-4-6",
+        "provider": "anthropic",
+        "api_key": "sk-override",
+        "base_url": "",  # buggy override produced by some /model paths
+        "api_mode": "anthropic_messages",
+    }
+
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model",
+        lambda _cfg=None: "claude-opus-4-6",
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "anthropic",
+            "api_key": "sk-config",
+            "base_url": "https://baseai.rivergame.net",
+            "api_mode": "anthropic_messages",
+        },
+    )
+
+    model, rt = runner._resolve_session_agent_runtime(
+        source=source,
+        session_key=sk,
+        user_config={},
+    )
+
+    assert model == "claude-opus-4-6"
+    assert rt["provider"] == "anthropic"
+    assert rt["api_key"] == "sk-override"
+    # Critical regression check: blank override base_url must not wipe runtime base_url
+    assert rt["base_url"] == "https://baseai.rivergame.net"
 
 
 # ---------------------------------------------------------------------------
