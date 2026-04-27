@@ -51,10 +51,28 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
-# Sentinel: when a cron agent has nothing new to report, it can start its
-# response with this marker to suppress delivery.  Output is still saved
-# locally for audit.
-SILENT_MARKER = "[SILENT]"
+# Sentinel: when a cron agent has nothing new to report, it can return this
+# exact control token to suppress delivery. Output is still saved locally for
+# audit. Use a private, scheduler-owned marker to avoid collisions with normal
+# report text that may legitimately mention "[SILENT]".
+SILENT_MARKER = "<HERMES_CRON_SILENT::7F2C9E8B_4A6D_4D33_A4F1_8E7C1B9A6D42>"
+LEGACY_SILENT_MARKER = "[SILENT]"
+
+
+def _is_silent_response(content: str) -> bool:
+    """Return True only for exact silent control tokens.
+
+    Backward compatibility: accept the legacy [SILENT] token only when the
+    entire response is exactly that marker (case-insensitive after trimming).
+    This prevents normal reports that quote or mention [SILENT] from being
+    accidentally suppressed.
+    """
+    normalized = (content or "").strip()
+    if not normalized:
+        return False
+    if normalized == SILENT_MARKER:
+        return True
+    return normalized.upper() == LEGACY_SILENT_MARKER
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
@@ -84,6 +102,9 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     if deliver == "local":
         return None
 
+    # "origin" mode is deprecated — new jobs use explicit "platform:chat_id".
+    # If a legacy job still has deliver="origin", resolve it from the origin
+    # dict directly (no fallback chain).
     if deliver == "origin":
         if origin:
             return {
@@ -91,21 +112,6 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": origin.get("thread_id"),
             }
-        # Origin missing (e.g. job created via API/script) — try each
-        # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in ("matrix", "telegram", "discord", "slack", "bluebubbles"):
-            chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
-            if chat_id:
-                logger.info(
-                    "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
-                    job.get("name", job.get("id", "?")),
-                    platform_name,
-                )
-                return {
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "thread_id": None,
-                }
         return None
 
     if ":" in deliver:
@@ -326,13 +332,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         job["id"], platform_name, chat_id, err,
                     )
                     adapter_ok = False  # fall through to standalone path
+                elif send_result and not getattr(send_result, "message_id", None):
+                    # Feishu P2P chats can return success=True but the message
+                    # never reaches the user (phantom success).  A missing
+                    # message_id is a strong signal of this — fall back to a
+                    # fresh standalone adapter which reliably resolves open_id.
+                    logger.warning(
+                        "Job '%s': live adapter to %s:%s returned success but no message_id, "
+                        "falling back to standalone",
+                        job["id"], platform_name, chat_id,
+                    )
+                    adapter_ok = False
 
             # Send extracted media files as native attachments via the live adapter
             if adapter_ok and media_files:
                 _send_media_via_adapter(runtime_adapter, chat_id, media_files, send_metadata, loop, job)
 
             if adapter_ok:
-                logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                logger.info("Job '%s': delivered to %s:%s via live adapter (message_id=%s)",
+                            job["id"], platform_name, chat_id,
+                            getattr(send_result, "message_id", None) if text_to_send else "no-text")
                 return None
         except Exception as e:
             logger.warning(
@@ -526,10 +545,12 @@ def _build_job_prompt(job: dict) -> str:
         "to the user — do NOT use send_message or try to deliver "
         "the output yourself. Just produce your report/output as your "
         "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        f"SILENT: If there is genuinely nothing new to report, respond "
+        f"with exactly \"{SILENT_MARKER}\" (nothing else) to suppress delivery. "
+        "This token is reserved for scheduler control; do not mention or quote it in normal output. "
+        "If any loaded skill or prompt text mentions \"[SILENT]\", treat that as legacy guidance and use the exact token above instead. "
+        f"Never combine {SILENT_MARKER} with content — either report your "
+        f"findings normally, or say {SILENT_MARKER} and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
     if skills is None:
@@ -959,13 +980,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
+                # If the agent responded with the exact silent control token,
+                # skip delivery (but output is already saved above). Failed jobs
+                # always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                if should_deliver and success and _is_silent_response(deliver_content):
+                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], deliver_content.strip())
                     should_deliver = False
 
                 delivery_error = None

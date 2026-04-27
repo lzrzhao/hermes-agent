@@ -471,6 +471,130 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(info["name"], "Hermes Group")
         self.assertEqual(info["type"], "group")
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_raw_message_uses_open_id_for_p2p(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._resolve_p2p_open_id = AsyncMock(return_value="ou_peer")
+        adapter._build_create_message_body = Mock(return_value="body")
+        adapter._build_create_message_request = Mock(return_value="request")
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(create=Mock(return_value=SimpleNamespace(success=lambda: True))),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(
+                adapter._send_raw_message(
+                    chat_id="oc_p2p_chat",
+                    msg_type="text",
+                    payload='{"text":"hello"}',
+                    reply_to=None,
+                    metadata=None,
+                )
+            )
+
+        adapter._build_create_message_body.assert_called_once_with(
+            receive_id="ou_peer",
+            msg_type="text",
+            content='{"text":"hello"}',
+            uuid_value=unittest.mock.ANY,
+        )
+        adapter._build_create_message_request.assert_called_once_with("open_id", "body")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_p2p_open_id_does_not_cache_lookup_failures(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _ChatAPI:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("transient failure")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(chat_mode="p2p", owner_id="ou_retry_ok"),
+                )
+
+        chat_api = _ChatAPI()
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    chat=chat_api,
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            first = asyncio.run(adapter._resolve_p2p_open_id("oc_p2p_chat"))
+            second = asyncio.run(adapter._resolve_p2p_open_id("oc_p2p_chat"))
+
+        self.assertIsNone(first)
+        self.assertEqual(second, "ou_retry_ok")
+        self.assertEqual(chat_api.calls, 2)
+        self.assertEqual(adapter._p2p_owner_cache["oc_p2p_chat"], "ou_retry_ok")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_p2p_open_id_does_not_cache_missing_owner_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _ChatAPI:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        success=lambda: True,
+                        data=SimpleNamespace(chat_mode="p2p", owner_id=None),
+                    )
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(chat_mode="p2p", owner_id="ou_retry_ok"),
+                )
+
+        chat_api = _ChatAPI()
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    chat=chat_api,
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            first = asyncio.run(adapter._resolve_p2p_open_id("oc_p2p_chat"))
+            second = asyncio.run(adapter._resolve_p2p_open_id("oc_p2p_chat"))
+
+        self.assertIsNone(first)
+        self.assertEqual(second, "ou_retry_ok")
+        self.assertEqual(chat_api.calls, 2)
+        self.assertEqual(adapter._p2p_owner_cache["oc_p2p_chat"], "ou_retry_ok")
+
 class TestAdapterModule(unittest.TestCase):
     def test_adapter_requirement_helper_exists(self):
         source = Path("gateway/platforms/feishu.py").read_text(encoding="utf-8")

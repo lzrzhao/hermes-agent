@@ -222,12 +222,20 @@ class TestJobCRUD:
         job = create_job(prompt="Recurring", schedule="every 1h")
         assert job["repeat"]["times"] is None
 
-    def test_default_delivery_origin(self, tmp_cron_dir):
+    def test_default_delivery_explicit_from_origin(self, tmp_cron_dir):
+        """When origin is provided, deliver defaults to explicit 'platform:chat_id'."""
         job = create_job(
             prompt="Test", schedule="30m",
             origin={"platform": "telegram", "chat_id": "123"},
         )
-        assert job["deliver"] == "origin"
+        assert job["deliver"] == "telegram:123"
+
+    def test_default_delivery_explicit_from_origin_preserves_thread(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Test", schedule="30m",
+            origin={"platform": "telegram", "chat_id": "123", "thread_id": "456"},
+        )
+        assert job["deliver"] == "telegram:123:456"
 
     def test_default_delivery_local_no_origin(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="30m")

@@ -859,7 +859,9 @@ class AIAgent:
                     'tools',               # all tools.* (terminal, browser, web, file, etc.)
                     'run_agent',            # agent runner internals
                     'trajectory_compressor',
-                    'cron',                 # scheduler (only relevant in daemon mode)
+                    # NOTE: 'cron' deliberately excluded — setLevel() is process-wide
+                    # and permanently suppresses cron.scheduler delivery diagnostics
+                    # when AIAgent(quiet_mode=True) runs inside the gateway process.
                     'hermes_cli',           # CLI helpers
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)

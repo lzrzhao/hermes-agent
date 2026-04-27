@@ -1078,6 +1078,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
+        self._p2p_owner_cache: Dict[str, Optional[str]] = {}  # chat_id → open_id (None = not p2p)
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -3263,6 +3264,37 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    # Cache for p2p chat → owner open_id lookups. None means confirmed non-p2p.
+
+    async def _resolve_p2p_open_id(self, chat_id: str) -> Optional[str]:
+        """If *chat_id* is a p2p (1-on-1) chat, return the peer's open_id.
+
+        Returns ``None`` for group chats or on lookup failure.  Results are
+        cached for the lifetime of the adapter instance.
+        """
+        if chat_id in self._p2p_owner_cache:
+            return self._p2p_owner_cache[chat_id]
+
+        try:
+            request = self._build_get_chat_request(chat_id)
+            response = await asyncio.to_thread(self._client.im.v1.chat.get, request)
+            if self._response_succeeded(response) and response.data:
+                chat_mode = getattr(response.data, "chat_mode", None)
+                if chat_mode == "p2p":
+                    owner_id = getattr(response.data, "owner_id", None)
+                    if owner_id:
+                        self._p2p_owner_cache[chat_id] = owner_id
+                        logger.debug("[Feishu] chat %s is p2p, owner open_id=%s", chat_id, owner_id)
+                        return owner_id
+                elif chat_mode:
+                    # Only cache confirmed non-p2p chats. If Feishu reports a
+                    # p2p chat without owner_id, retry later instead of
+                    # permanently poisoning the cache.
+                    self._p2p_owner_cache[chat_id] = None
+        except Exception as exc:
+            logger.debug("[Feishu] Failed to resolve p2p owner for chat %s: %s", chat_id, exc)
+        return None
+
     async def _send_raw_message(
         self,
         *,
@@ -3283,13 +3315,24 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(reply_to, body)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
+        # For p2p (1-on-1) chats, use the peer's open_id as receive_id.
+        # Feishu's create_message with receive_id_type='chat_id' in p2p chats
+        # returns success but the message is invisible to the user.  Using
+        # open_id resolves this reliably.
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        p2p_open_id = await self._resolve_p2p_open_id(chat_id)
+        if p2p_open_id:
+            receive_id = p2p_open_id
+            receive_id_type = "open_id"
+
         body = self._build_create_message_body(
-            receive_id=chat_id,
+            receive_id=receive_id,
             msg_type=msg_type,
             content=payload,
             uuid_value=str(uuid.uuid4()),
         )
-        request = self._build_create_message_request("chat_id", body)
+        request = self._build_create_message_request(receive_id_type, body)
         return await asyncio.to_thread(self._client.im.v1.message.create, request)
 
     @staticmethod

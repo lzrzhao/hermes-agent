@@ -897,24 +897,35 @@ class GatewayRunner:
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
-            override_model = override.get("model", model)
+            def _norm_override(value):
+                if isinstance(value, str):
+                    value = value.strip()
+                    return value or None
+                return value
+
+            override_model = _norm_override(override.get("model")) or model
             override_runtime = {
-                "provider": override.get("provider"),
-                "api_key": override.get("api_key"),
-                "base_url": override.get("base_url"),
-                "api_mode": override.get("api_mode"),
+                "provider": _norm_override(override.get("provider")),
+                "api_key": _norm_override(override.get("api_key")),
+                "base_url": _norm_override(override.get("base_url")),
+                "api_mode": _norm_override(override.get("api_mode")),
             }
-            if override_runtime.get("api_key"):
+            if (
+                override_runtime.get("provider")
+                and override_runtime.get("api_key")
+                and override_runtime.get("base_url")
+            ):
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     (resolved_session_key or "")[:30], model, override_model,
                     override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
+            # Override exists but is incomplete (usually blank base_url/api_key
+            # from a picker switch). Fall through to env/config runtime
+            # resolution and layer non-empty override fields on top.
             logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
+                "Session model override (incomplete, fallback): session=%s config_model=%s override_model=%s",
                 (resolved_session_key or "")[:30], model, override_model,
             )
         else:
@@ -4724,10 +4735,10 @@ class GatewayRunner:
                         )
                         _self._session_model_overrides[_session_key] = {
                             "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
+                            "provider": (result.target_provider or "").strip() or None,
+                            "api_key": (result.api_key or "").strip() or None,
+                            "base_url": (result.base_url or "").strip() or None,
+                            "api_mode": (result.api_mode or "").strip() or None,
                         }
 
                         # Evict cached agent so the next turn creates a fresh
@@ -4842,10 +4853,10 @@ class GatewayRunner:
         # Store session override so next agent creation uses the new model
         self._session_model_overrides[session_key] = {
             "model": result.new_model,
-            "provider": result.target_provider,
-            "api_key": result.api_key,
-            "base_url": result.base_url,
-            "api_mode": result.api_mode,
+            "provider": (result.target_provider or "").strip() or None,
+            "api_key": (result.api_key or "").strip() or None,
+            "base_url": (result.base_url or "").strip() or None,
+            "api_mode": (result.api_mode or "").strip() or None,
         }
 
         # Evict cached agent so the next turn creates a fresh agent from the
@@ -7771,19 +7782,43 @@ class GatewayRunner:
         """Apply /model session overrides if present, returning (model, runtime_kwargs).
 
         The gateway /model command stores per-session overrides in
-        ``_session_model_overrides``.  These must take precedence over
+        ``_session_model_overrides``. These must take precedence over
         config.yaml defaults so the switched model is actually used for
-        subsequent messages.  Fields with ``None`` values are skipped so
-        partial overrides don't clobber valid config defaults.
+        subsequent messages.
+
+        Important nuance: when the override switches providers, blank runtime
+        fields from the picker (e.g. base_url/api_key) must clear inherited
+        values from the previous provider instead of silently mixing two
+        providers together.
         """
         override = self._session_model_overrides.get(session_key)
         if not override:
             return model, runtime_kwargs
-        model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode"):
-            val = override.get(key)
-            if val is not None:
+
+        def _normalize(value):
+            if isinstance(value, str):
+                value = value.strip()
+                return value or None
+            return value
+
+        override_model = _normalize(override.get("model"))
+        override_provider = _normalize(override.get("provider"))
+        if override_model:
+            model = override_model
+
+        current_provider = _normalize(runtime_kwargs.get("provider"))
+        provider_changed = bool(override_provider and override_provider != current_provider)
+
+        if override_provider:
+            runtime_kwargs["provider"] = override_provider
+
+        for key in ("api_key", "base_url", "api_mode"):
+            val = _normalize(override.get(key))
+            if val:
                 runtime_kwargs[key] = val
+            elif provider_changed:
+                runtime_kwargs.pop(key, None)
+
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:

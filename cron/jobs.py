@@ -411,9 +411,16 @@ def create_job(
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
-    # Default delivery to origin if available, otherwise local
+    # Default delivery: build explicit "platform:chat_id" from origin so the
+    # delivery path is always deterministic.  The old "origin" mode had bugs
+    # (string-format origins, None origins, phantom-success fallback chains).
     if deliver is None:
-        deliver = "origin" if origin else "local"
+        if origin and isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
+            deliver = f"{origin['platform']}:{origin['chat_id']}"
+            if origin.get("thread_id"):
+                deliver = f"{deliver}:{origin['thread_id']}"
+        else:
+            deliver = "local"
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
